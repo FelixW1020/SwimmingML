@@ -1,0 +1,203 @@
+# Two-stage: predict time then place for a chosen event (Colab-ready)
+# Paste into one Colab cell and run.
+
+import re
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_absolute_error, accuracy_score, classification_report
+import joblib
+from IPython.display import display
+
+DATA_PATH = "/content/tokyo_2020_swim.csv"   # change if needed
+df = pd.read_csv(DATA_PATH)
+print("Loaded", DATA_PATH, "shape:", df.shape)
+
+# Simple time parser (handles numeric or "M:SS.xx" formats)
+def time_to_seconds(x):
+    if pd.isna(x): return np.nan
+    if isinstance(x, (int,float,np.float64,np.int64)): return float(x)
+    s = str(x).strip()
+    if s == "": return np.nan
+    if ':' in s:
+        parts = s.split(':')
+        try:
+            parts = [float(p) for p in parts]
+        except:
+            return np.nan
+        seconds = parts[-1]
+        minutes = parts[-2] if len(parts) >= 2 else 0
+        hours = parts[-3] if len(parts) >= 3 else 0
+        return hours*3600 + minutes*60 + seconds
+    try:
+        return float(re.sub(r'[^\d\.]', '', s))
+    except:
+        return np.nan
+
+# Show a few unique events to help you copy/paste the exact event name
+print("\nExample events (first 30 unique):")
+print(df['event'].dropna().unique()[:30])
+
+EVENT = input("\nPaste an event name from above (e.g. 'men 100m backstroke'): ").strip()
+if EVENT == "":
+    raise SystemExit("No event provided. Re-run and paste an event name.")
+
+# Filter to selected event (case-insensitive contains)
+mask = df['event'].astype(str).str.contains(EVENT, case=False, na=False)
+df_ev = df[mask].copy()
+print("Rows for event (before filtering):", df_ev.shape[0])
+if df_ev.shape[0] == 0:
+    raise SystemExit("No rows matched that event. Re-run and paste an event name exactly as shown above.")
+
+# Prepare target and drop rows without time or place
+if 'time' not in df_ev.columns:
+    raise SystemExit("CSV must have a 'time' column with race times.")
+df_ev['time_sec'] = df_ev['time'].apply(time_to_seconds)
+df_ev = df_ev[~df_ev['time_sec'].isna()].copy()
+print("Rows with parsable time:", df_ev.shape[0])
+
+# Ensure place exists for place-model training (we'll still predict time even if place missing for some rows)
+if 'place' not in df_ev.columns:
+    raise SystemExit("CSV must have a 'place' column (finishing position).")
+
+# Cast place to int where possible (drop rows where place missing for place-modeling)
+df_ev = df_ev.reset_index(drop=True)
+df_ev['place'] = pd.to_numeric(df_ev['place'], errors='coerce')
+
+# ----- Choose realistic features (pre-race or mid-race) -----
+# We prefer these: reaction_time (start), split_50 (mid-race), lane (pre-race)
+preferred = ['reaction_time', 'split_50', 'lane']
+time_features = [c for c in preferred if c in df_ev.columns]
+if not time_features:
+    # fallback: any numeric columns except time_sec and place
+    time_features = [c for c in df_ev.select_dtypes(include=[np.number]).columns if c not in ('time_sec','place')]
+print("Using time-features:", time_features)
+
+# ---------- Stage 1: Time regression ----------
+X_time = df_ev[time_features].copy()
+y_time = df_ev['time_sec'].copy()
+
+# build numeric/categorical lists
+num_cols = X_time.select_dtypes(include=[np.number]).columns.tolist()
+cat_cols = [c for c in X_time.columns if c not in num_cols]
+
+num_pipe = Pipeline([('imputer', SimpleImputer(strategy='median')), ('scale', StandardScaler())])
+cat_pipe = Pipeline([('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+                     ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False))])
+
+time_preproc = ColumnTransformer([('num', num_pipe, num_cols), ('cat', cat_pipe, cat_cols)])
+time_model = Pipeline([('preproc', time_preproc),
+                       ('reg', RandomForestRegressor(n_estimators=200, random_state=42))])
+
+# Train/test split and fit
+X_ttrain, X_ttest, y_ttrain, y_ttest = train_test_split(X_time, y_time, test_size=0.2, random_state=42)
+print("\nTraining time model on rows:", X_ttrain.shape[0])
+time_model.fit(X_ttrain, y_ttrain)
+y_tpred = time_model.predict(X_ttest)
+print("Time model MAE (s):", mean_absolute_error(y_ttest, y_tpred))
+
+# Save predicted_time back to df_ev for Stage 2
+df_ev = df_ev.copy()
+df_ev['predicted_time'] = time_model.predict(X_time)
+
+# ---------- Stage 2: Place classification ----------
+# Keep rows where place is known
+df_place = df_ev[~df_ev['place'].isna()].copy()
+df_place['place'] = df_place['place'].astype(int)
+
+# Use predicted_time and lane as features (lane may be missing sometimes)
+place_features = ['predicted_time']
+if 'lane' in df_place.columns:
+    place_features.append('lane')
+print("Using place-features:", place_features)
+X_place = df_place[place_features].copy()
+y_place = df_place['place'].copy()
+
+# If there are too many distinct place values (e.g., >10) you can choose to model top-k instead;
+# for now we model exact place if sample size allows.
+print("Unique places in data:", sorted(y_place.unique())[:20])
+
+# Preprocess numeric only (both are numeric)
+place_num_cols = X_place.select_dtypes(include=[np.number]).columns.tolist()
+place_preproc = ColumnTransformer([('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scale', StandardScaler())]), place_num_cols)])
+
+place_model = Pipeline([('preproc', place_preproc),
+                        ('clf', RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced'))])
+
+# Train/test split and fit place model
+X_ptrain, X_ptest, y_ptrain, y_ptest = train_test_split(X_place, y_place, test_size=0.2, random_state=42)
+print("\nTraining place model on rows:", X_ptrain.shape[0])
+place_model.fit(X_ptrain, y_ptrain)
+y_ppred = place_model.predict(X_ptest)
+print("Place accuracy:", accuracy_score(y_ptest, y_ppred))
+print("\nClassification report (place):")
+print(classification_report(y_ptest, y_ppred, zero_division=0))
+
+# Save both models for reuse
+joblib.dump({'time_model': time_model, 'place_model': place_model, 'time_features': time_features, 'place_features': place_features}, "/content/time_and_place_models.joblib")
+print("\nSaved models to /content/time_and_place_models.joblib")
+
+# ---------- Interactive predictor ----------
+def seconds_to_mmss(s):
+    if pd.isna(s): return "N/A"
+    s = float(s)
+    m = int(s // 60)
+    sec = s - m*60
+    return f"{m}:{sec:05.2f}" if m > 0 else f"{sec:.2f}s"
+
+def predict_time_and_place_interactive():
+    print("\nEnter values for early-race features. Press Enter to use an example value shown in brackets.")
+    user = {}
+    # example row (first non-null)
+    ex_row = X_time.dropna().iloc[0] if not X_time.dropna().empty else X_time.iloc[0]
+    for f in time_features:
+        ex = ex_row[f] if f in ex_row else ''
+        raw = input(f"{f} [example {ex}]: ").strip()
+        if raw == "":
+            user[f] = ex
+        else:
+            # try numeric
+            try:
+                user[f] = float(raw)
+            except:
+                user[f] = raw
+
+    user_df = pd.DataFrame([user], columns=time_features)
+    # coerce numeric columns
+    for c in num_cols:
+        if c in user_df.columns:
+            user_df[c] = pd.to_numeric(user_df[c], errors='coerce')
+
+    # Predict time
+    pred_time = time_model.predict(user_df)[0]
+
+    # Build input for place model
+    place_input = {}
+    place_input['predicted_time'] = pred_time
+    if 'lane' in place_features:
+        place_input['lane'] = user.get('lane', ex_row.get('lane', np.nan))
+
+    place_df = pd.DataFrame([place_input], columns=place_features)
+    for c in place_num_cols:
+        if c in place_df.columns:
+            place_df[c] = pd.to_numeric(place_df[c], errors='coerce')
+
+    pred_place = place_model.predict(place_df)[0]
+    probs = place_model.predict_proba(place_df)[0]
+
+    print("\nRESULT:")
+    print(" Predicted final time (s):", round(pred_time, 3))
+    print(" Predicted final time (MM:SS):", seconds_to_mmss(pred_time))
+    print(" Predicted place:", pred_place)
+    print(" Place probabilities:")
+    for cls, p in zip(place_model.named_steps['clf'].classes_, probs):
+        print(f"  Place {cls}: {p:.3f}")
+
+    return pred_time, pred_place, probsww
+
+print("\nReady. To try interactive prediction run:\n  predict_time_and_place_interactive()")
